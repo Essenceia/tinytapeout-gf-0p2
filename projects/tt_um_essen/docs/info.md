@@ -1,231 +1,223 @@
-<!---
+# Blake2s
 
-This file is used to generate your project datasheet. Please fill in the information below and delete any unused
-sections.
+This ASIC is a hashing accelerator for the Blake2 cryptographic hash function (RFC 7693).
 
-You can also include images in this folder and reference them in the markdown. Each image must be less than
-512 kb in size, and the combined size of all images must be less than 1 MB.
--->
-# Multiply and accumulate matrix multiplier ASIC with design for test infrastructure
+It is a fully featured Blake2s implementation supporting both block streaming and using a secret key, with a maximum hash rate of 41.42 MB/s and a 
+target operating frequency of 66 MHz.
 
-ASIC design for a 2x2 systolic matrix multiplier supporting multiply and accumulate
-operations on int8 data alongside a design for test infrastructure to help debug
-both usage and diagnose design issues in silicon.
+## Blake2s Algorithm
 
+Blake2 is a cryptographic hash function used for applications such as digital signatures, integrity protection and message authentication. It comes in 2 variants, Blake2b and the less memory intensive Blake2s.
 
-# MAC 
+|                 |    BLAKE2s       |
+|-----------------|------------------|
+| Block bytes     | bb = 64          |
+| Hash bytes      | 1 <= nn <= 32    |
+| Key bytes       | 0 <= kk <= 32    |
+| Input bytes     | 0 <= ll < 2**64  |
+              
+In Blake2s, data is processed in blocks of $bb = 64$ bytes, where each block is run through a compression function for multiple rounds of mixing operations. 
 
-This MAC accelerator operates at up to 50MHz and is capable of reaching up to 100MAC/s or 200MIOP/s.
+Each Blake2s run can be configured with specific values for $kk$, $nn$, and $ll$. 
 
-## Background 
+The parameter $kk$ represents the optional key length in bytes ($[0;32]$), where $kk = 0$ means keyless hashing and $kk > 0$ enables keyed mode. 
 
-The goal of the MAC accelerator is to perform a matrix matrix multiplication between the input data
-matrix $I$ and the weight matrix $W$. 
-```math
-\begin{gather}
-I \times W = R \\
-\begin{pmatrix} 
-i_{0,0} & i_{1,0} \\
- i_{0,1} & i_{1,1} 
-\end{pmatrix} 
+$nn$ specifies the output hash size in bytes ($[1;32]$), while $ll$ denotes the total input message length in bytes (up to $2^{64}-1$). 
 
-\times 
+After processing all input data blocks, the final state is truncated to $nn$ bytes to produce the hash output.
 
-\begin{pmatrix} 
-w_{0,0} & w_{1,0} \\ 
-w_{0,1} & w_{1,1} 
-\end{pmatrix} = 
+## Usage
 
-\begin{pmatrix} 
-i_{0,0}w_{0,0}+i_{1,0}w_{0,1} & i_{0,0}w_{1,0}+i_{1,0}w_{1,1}\\ 
-i_{0,1}w_{0,0}+i_{1,1}w_{0,1} & i_{0,1}w_{1,0}+i_{1,1}w_{1,1}\end{pmatrix}
-\end{gather}
-```
-This MAC accelerator has 4 units and from this point on, we will refer to each MAC unit according to their unique $(x,y)$ coordinates. 
-
-Each MAC unit calculates the MAC operation $c_{(t,x,y)}$, where :
-- $w_{(x,y)}$ is the fixed weight configured for this unit; this value is fixed throughout a set of $I$ and $W$ input matrices.
-- $i_{(t,y)}$ is a value from the $y$ row of the $I$ matrix that is circulated per timestep $t$ through a row of the matrix.
-- $c_{(t-1,x,y-1)}$ is the result at the previous timestep $t-1$ of the mac unit above this MAC unit, circulated downwards per column.
-```math
-c_{(t,x,y)} = i_{(t,y)} \times w_{(x,y)} + c_{(t-1,x,y-1)}
-```
-
-Given this accelerator was designed to operate on signed 8-bit integers, 
-but that the successive application of the 8-bit multiplication and addition 
-pushes the resulting value up to 17 bits, in order to prevent the size of the base datatype 
-from increasing with each successive MAC operation, we need to clamp it down back within the 8-bit range.
-
-As such, the MAC unit performs an additional clamping function $clamp_{i8}$ that remaps :
-```math
-clamp_{i8}(c_{(t,x,y)}) = \begin{cases}
-   127 &\text{if } c_{(t,x,y}) > 127\\
-   c_{(t,x,y)} &\text{if } c_{(t,x,y)} \in [-128,127] \\
-    -128 &\text{if } c_{(t,x,y}) < -128\\
-\end{cases}
-```
-
-Our final full MAC operation is as follows : 
-```math
-c_{(t,x,y)} = clamp_{i8}(i_{(t,y)} \times w_{(x,y)} + c_{(t-1,x,y-1)})
-```
-
-At each MAC timestep $t+1$ :
-- the result of a MAC unit $c_{(t,x,y)}$ is shifted downwards on the same column and becomes the input of the MAC unit $(x,y+1)$ below.
-- $i_{(t,x)}$ is shifted rightwards and used as input to MAC unit $(x+1,y)$. 
-
-This data streaming allows such designs to make more efficient use of data, re-using it multiple times as the data circulates through the array, contributing to the final results without spending time on expensive data accesses, allowing us to dedicate more of our silicon area and cycles to compute.
-
-## Thoughput
-
-Assuming a pre-configured $W$ weight matrix is being reused and the accelerator is receiving a gapless stream of multiple $I$ input matrices, this MAC accelerator is capable of computing up to 100 MMAC/s or 200 MIOPS/s.
-
-### IO Bottleneck
-
-Accelerator operations are stalled if a MAC operation has a data dependency on data that has yet to arrive. For example, calculating $r_{(0,0)}$ depends on both $i_{(0,0)}$​ and $i_{(1,0)}$​.
-In practice, each operation depends on two pieces of input data, yet our input interface being only 8 bits wide allows us to transfer only a single $i_{(x,y)}$​ per cycle.
-
-This limitation means our accelerator is actually operating at half maximum capacity due to this IO bottleneck. If the IO interface were either (a) at least 16 bits wide, or (b) 8 bits wide but operating at 100 MHz, resolving this bottleneck, our maximum throughput would be 200 MMAC/s or 400 MIOPS/s
-
-## Usage 
-
-The typical sequence to offload matrix operations to the accelerator would go as follows:
+The typical sequence to offload the hashing operation to the accelerator would go as follows:
 1. Reset the accelerator (necessary on init)
-2. Configure the weights $W$ (can be re-used once configured)
-3. Send the input data $I$
-4. Read the result $R$
+2. Configure the hash parameters $kk$, $nn$, $ll$ (can be reused once configured)
+3. Stream the input data by blocks of 64 bytes
+4. Read the hash result
 
-This design doesn't feature on-chip SRAM and has limited on-chip memory.
-Given weights have high spatial and temporal locality, this design allows each weight to be configured per MAC unit. This configuration can be reused across multiple matrices.
-The input matrix, on the other hand, is expected to be provided on each usage.
-
-Given our input and output data buses are only 8 bits wide, for data transfers to and from the chip the matrices are flattened in the following order:
-
-![flattened](flat.svg)
+All data exchanges with the accelerator are in little endian, and when sending multiple-byte-long arrays, the lower indexes are sent first.
 
 Notes:
-- All references to `cycles` below are clocked according to the `clk` pin.
-- Empty cycles, as in one or more cycles where `data_v_i` would go low in the middle of the transfer of both the input matrix and the weights, are supported.
+- Empty data transfer cycles, as in one or more clock cycles where `valid_i` would go low in the middle of the transfer of both the input data and the configuration, are supported.
+### Reset
+
+In order to reset this accelerator to its default uninitialized state, deassert the `rst_n` signal for at least 5 clock cycles. During normal operations, `rst_n` should be set to `1`.
+
+During at least 5 clock cycles:
+- `rst_n` is set to `0`
+
+#### Example
+
+Typical reset sequence:
+
+![rst waves](rst_waves.png)
+
+### Sending the Configuration
+
+The configuration packet is 10 bytes long and has the following format:
+
+![Configuration packet](packet.svg)
+
+$kk$ and $nn$ are both 8 bits wide, and $ll$ is 64 bits wide, and all use little endian.
+
+Sending the configuration takes 10 data transfer cycles, during which:
+- `valid_i` is set to `1`
+- `cmd_i[1:0]` is set to `0`, indicating we are sending the configuration packet
+- `data_i[7:0]` sends the next byte of the configuration packet
+
+#### Example
+
+In this example we are sending the following configuration:
+- $kk = 1$ (1 Byte)
+- $nn = 32$ (1 Byte) 
+- $ll = 67$ (8 Bytes) 
+
+![config waves](config_waves.png)
+
+#### Software
+
+In the firmware, the `send_config` function defined in `data_wr_utils.h` is used to send a configuration to the accelerator.
+```C
+void send_config(uint8_t kk, uint8_t nn, uint64_t ll, uint dma_chan, pinout_t *p, size_t pl, PIO pio, uint sm);
+```
+Parameters : 
+- `kk` configuration value, key length
+- `nn` configuration value, final hash length in bytes
+- `ll` configuration value, raw data length
+- `dma_chan` is the DMA channel used to offload copying data between the memory and the RP2040's PIO
+- `p` is a pointer to the shared pre-allocated pool of memory we can temporarily use to allocate the necessary `pinout_t`
+- `pio` is the base address of the PIO where the data write program is running
+- `sm` is the index of the PIO state machine where the data write program is running
+
+### Sending Data
+
+Just like in the original hashing algorithm, the stream of data to be hashed must first be padded with `0x00` to a multiple of 64 bytes, then starting from the lowest indexes first, blocks are sent one by one, one byte at a time.
+
+The sequence to send a block is as follows:
+- Wait for ASIC to set `ready_v_o` to `1`
+
+Then, start the 64 data transfer cycles during which:
+- `valid_i` is set to `1`
+- `cmd_i[1:0]` is set to :
+  - `1` if this is the first data transfer cycle of the first block
+  - `3` if this is the last data transfer cycle of the last block
+  - `2` by default
+- `data_i[7:0]` contains the current data byte
+
+The `ready_v_o` signal indicates the accelerator is ready to receive data. In order to improve performance, users can skip waiting for this signal to be re-asserted between each byte transfer and can safely proceed with sending the entire block as soon as the `ready_v_o` signal is observed at `1`.
+
+⚠️ Critical Timing Requirement: When using the optimization, since it takes 2 clock cycles for the new value of `ready_v_o` to be written on the output pin, users must guarantee at least a 30ns gap (for 66MHz) between the end of the previous block write and the evaluation of the next `ready_v_o` signal. The current firmware guarantees such a gap.
+
+#### Single Block Example
+
+This is an example of a simple data transfer sequence where the entirety of the data fits within a single block.
+
+Given there is a single block, meaning it is both the first and last block, the `mode_i` control bits are set to `1` on the first cycle and `3` on the last cycle.
+
+![single block data transfer example](wr_data_waves.png)
+
+#### Multi-Block Example
+
+In this example we are sending two blocks of data.
+
+This example shows the data transfer associated with the configuration waves used as an example above ($kk = 1, nn = 32, ll = 67$).
+
+The first block contains the key of size $kk = 1$ byte, the key's contents are 'a' and padded with `0x00` up to 64 bytes.
+
+After the first block has finished sending, we wait until the accelerator asserts the `ready_v_o` signal before starting the second transfer.
+
+The second block contains the $ll - (kk>0?64:0)$, here 3, bytes of data "abc", again padded with `0x00` until 64 bytes.
+
+![multi block data transfer example](double_wr_data_waves.png)
+
+#### Software 
+
+In the firmware, for sending data to the accelerator we use the `send_data` function defined in the `data_wr_utils.h` header.
+```C
+void send_data(uint8_t *data, size_t dl, pinout_t *p, size_t pl, uint dma_chan, PIO pio, uint sm);
+```
+Parameters : 
+- `data` is a pointer to the raw data (not extended to a multiple of 64 bytes) to be hashed
+- `dl` is the `data` length in bytes
+- `p` is a pointer to the shared pre-allocated pool of memory we can temporarily use to allocate the necessary `pinout_t`
+- `dma_chan` is the DMA channel used to offload copying data between the memory and the RP2040's PIO
+- `pio` is the base address of the PIO where the data write program is running
+- `sm` is the index of the PIO state machine where the data write program is running
+
+### Slow Output Mode
+
+For the `sky130b` shuttle, although the maximum stable GPIO input switching frequency is 66 MHz, due to a weak driver on the output buffer path resulting in much higher slew rate, the current maximum output stable supported transitioning frequency is 33 MHz. 
+
+In order to allow more room for experimenting with the limits of the maximum stable output switching rate while supporting a more stable operating mode, the "slow output" mode was added to this design.
+
+⚠️ Users simply looking to reliably use the accelerator should always have the slow output mode set.
+
+This mode can be enabled by setting `output_mode_i[1:0]` at any time while the accelerator is hashing or receiving data, but for more reliability, we recommend the user simply clamp these pins using the GPIO.
+
+Setting the slow output mode:
+- `output_mode_i[1:0]` is set to `3`
+
+Setting the default fast output mode:
+- `output_mode_i[1:0]` is set to `0`
+
+### Reading the Hash
+
+After the accelerator finishes hashing the last block, it will begin streaming out the final hash result.
+
+In Blake2, the $nn$ configuration parameter specifies how many bytes long the resulting hash should be. This accelerator follows this convention and will only return $nn$ bytes as a result.
+
+Since this accelerator was designed to interface with an embedded MCU and not another accelerator or an FPGA, the accelerator asserts the `hash_v_o` signal ahead of starting to stream out the result. This is done so that we can allow the RP2040 PIO to detect the start of the result sequence and initiate capturing the data. Because of this, this accelerator is tightly co-designed with the RP2040 in mind and cannot be ported to other MCU families, as it is reliant on a 15ns/30ns (if slow mode is set) reaction time, followed by very timing-accurate capture of the GPIO values. See `firmware/data_rd.pio` for this PIO assembly program.
+
+If slow output mode is set (see [above](#slow-output-mode)), all data steps in the data output sequence take 2 clock cycles; otherwise, each step takes 1 cycle.
+
+The hash read sequence has 2 parts:
+1. `h_v_o` (`hash_v_o`) is set to `1` for 1 step (1/2 clock cycles) in order to let the PIO initiate data capture
+2. The hash result is streamed over $nn$ steps:
+   - `h_v_o` (`hash_valid_o`) is set to `1`
+   - `h_o` (`hash_o[7:0]`) contains the hash result
   
-### Resetting MAC 
+ #### Example Hash result in slow output mode
 
-Given we are not sending an index alongside each data transfer to indicate which weight/data coordinates ( index ) each data corresponds to, 
-the MAC accelerator keeps track of the next index internally. As such, if due to external reasons a partial transfer occurs, it becomes necessary 
-to reset this index using the reset sequence described below. 
+In this example, slow output mode is set, and the accelerator is returning a hash result of $nn = 32$  bytes long. 
 
-The weights streaming indexes and the data streaming indexes can be reset independently, each requires a single data
-transfer cycle during which : 
-- `data_v_i` is set to `1`
-- `data_mode_i` is set to `0` if we are resetting the `weights` indexes, `1` to reset the data indexes
-- `data_i[7:0]` is ignored
-- `data_rst_addr_i` is set to `1`
+![Slow read waves output](slow_rd_data_waves.png) 
 
-#### Example
+ #### Example Hash result in fast output mode 
 
-In this example we are resetting both the data streaming index and the weight index back to back. 
+In this example, the defatul fast output mode is used, and the accelerator is returning a hash result of $nn = 32$  bytes long. 
 
-![rst configuration timing diagram](rst_waves.png)
+![Fast read waves output](fast_rd_data_waves.png) 
 
-### Configure weights
+#### Software 
 
-Configuring the weights takes 4 data transfer cycles, during which : 
-- `data_v_i` is set to `1`
-- `data_mode_i` is set to `0` indicating we are sending `weights`
-- `data_i[7:0]` contains the weights
-- `data_rst_addr_i` is set to `0`
+In order to capture this hash result, given the high-speed nature of the transfer and the precision needed in the capture, the entire capture sequence is offloaded to the PIO. Additionally, since, depending on the configured $nn$, the PIO RX FIFO (internal rx buffer) might be too small to store all of the hash result, a DMA stream is set up to automatically transfer RX FIFO entries to memory.
 
-#### Example 
+Given there is only on the order of 1.5µs between the last data transfer cycle of the last block and the start of the hash result, and given this is not remotely enough time for our MCU to reliably set up a new data capture, the hash result read must be set up before the last data transfer cycle. In practice, in the firmware we use `setup_rd_dma_hash_stream` to set up this DMA stream before the start of any input data streaming, see `firmware/main.c`.
 
-In this example we are configuring the the weight matrix $W$ to : 
-```math
-W = 
-\begin{pmatrix} 
-0 & 1 \\ 
-2 & 3 
-\end{pmatrix} 
-```
-![weights configuration timing diagram](wr_weights_waves.png)
+Unlike the input data streaming from the MCU to the accelerator, the hash result is a gapless stream where data is transferred at every step. As such, it is very important that the MCU be able to stream uninterrupted without dropping any of the result bytes. Because of this, the DMA stream between the PIO SM used for reading and the memory is set up to be of the highest priority.
 
-#### Debug
-
-The implemented JTAG TAP can be used to easily debug the weight matrix configuration sequence as it allows the user using the `USER_REG` instruction to 
-read the currently configured weights for each MAC unit. 
-
-In the existing openocd helper scripts located at `jtag/openocd.cfg` the `read_user_reg` can we used to read the weights using openocd when used as follows : 
-```tcl
-set r 0
-for {set u 0} {$u <= $USER_REG_UNIT_MAX} {incr u} {
-    puts "read internal register $u : 0x[read_user_reg $_CHIPNAME $u $r] - [print_reg_id $r]"  
-}
+Set up DMA stream to capture the hash result, part of `data_rd_utils.h`:
+```C
+void setup_rd_dma_hash_stream(uint dma_chan, uint nn, uint8_t* buffer, size_t bl, PIO pio, uint sm);
 ```
 
-For the $W$ weight matrix configured in the example above, the expected output should be : 
+Parameters:
+- `dma_chan` - high priority DMA channel used to read from the PIO SM to memory
+- `nn` - hash result length in bytes
+- `buffer` - pointer to the target location in memory the DMA should write to
+- `bl` - buffer length in bytes
+- `pio` - base address of the PIO performing the hash read operation
+- `sm` - index of the PIO state machine currently running with the hash read program
+
+Given all the reading and transfer operations were already handled under the hood by the PIO and DMA, the `read_hash` function only needs to wait for the end of the DMA transfer operations and copy the hash result written by the DMA into the `hash` buffer.
+
+Read the hash result from the DMA target memory location, part of `data_rd_utils.h`:
+```C
+void read_hash(uint8_t* hash, uint8_t nn, uint8_t* buffer, size_t bl, uint dma_chan);
 ```
-read internal register 0 : 0x00 - weight
-read internal register 1 : 0x01 - weight
-read internal register 2 : 0x02 - weight
-read internal register 3 : 0x03 - weight
-```
 
-### Sending the input matrix
-
-Sending the input matrix takes 4 data transfer cycles, during which : 
-- `data_v_i` is set to `1`
-- `data_mode_i` is set to `1` indicating we are sending the input matrix
-- `data_i[7:0]` contains the input data
-- `data_rst_addr_i` is set to `0`
-
-#### Example
-
-In this example we are sending the the input data matrix $I$ : 
-```math
-I = 
-\begin{pmatrix} 
-4 & 5 \\ 
-6 & 7 
-\end{pmatrix} 
-```
-![data configuration timing diagram](wr_data_waves.png)
-
-### Receiving result
-
-When receiving a result the asic will drive the following pins during 
-4 data transfer cycles : 
-- `res_v_o` is set to `1`
-- `res_o[7:0]` contains the result of the MAC operation for a single matrix coordinate
-
-Internally, the accelerator takes at most 4 cycles to produce a result operate on incomming data, this accounts for incomming data latching and circulating the data though the entire systolic array and output streaming. The accelerator moves the incomming data though the array as soon as it is available. Because of this, and since this accelerator supports gaps in the incomming data if that last data transfer of $i_{(1,1)}$ is delayed by at least 2 cycles, then the accelerator result will start streaming out before all of the input matrix has finished streaming in. 
-
-
-If the user sends a gapless, uninterupted stream of input data, and re-uses the same weights, this accelerator is capable of up to 100MMAC/s or 200MIOPS/s. 
-
-
-#### Simlpe example
-
-In this example the $W$ MAC weight matrix is being configured and the $I$ data is being streamed in, following which, the $R$ result starts being sent out. 
-```math
-R = I \times W = 
-\begin{pmatrix} 
-4 & 5 \\ 
-6 & 7 
-\end{pmatrix}
-\times
-\begin{pmatrix} 
-0 & 1 \\ 
-2 & 3 
-\end{pmatrix}
-=
-\begin{pmatrix} 
-10 & 19 \\ 
-14 & 27
-\end{pmatrix}
-```
-![result streamout](rd_res_waves.png)
-
-#### Complex example 
-
-Internally, the accelerator takes at most 4 cycles to produce a result from incoming data. This accounts for incoming data latching, circulating the data through the entire systolic array, and output streaming. The accelerator moves the incoming data through the array as soon as it is available. Because of this, and since this accelerator supports gaps in the incoming data stream, if the last data transfer of $i_{(1,1)}$.
-
-This is why, in the firmware (`firmware/main.c`), we set up the DMA stream to receive the data before we start sending the input matrix, as the gap between sending and getting the result is too small for the controlling MCU to perform any type of compute.
-
-![none trivial read sequence](rd_res_complex_waves.png)
+Parameters:
+- `hash` - pointer to the buffer to which the hash result will be copied
+- `nn` - hash result length in bytes
+- `buffer` - pointer to the target location in memory the DMA should write to
+- `bl` - buffer length in bytes
+- `dma_chan` - high priority DMA channel used to read from the PIO SM to memory
